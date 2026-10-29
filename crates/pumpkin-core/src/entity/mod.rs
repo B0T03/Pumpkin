@@ -171,6 +171,28 @@ impl dyn EntityBase + '_ {
     }
 }
 
+/// Maps Java entity types to Bedrock runtime entity identifiers where the naming differs.
+#[must_use]
+pub const fn entity_type_to_bedrock_identifier(entity_type: &EntityType) -> &'static str {
+    if entity_type.id == EntityType::EXPERIENCE_ORB.id {
+        "minecraft:xp_orb"
+    } else if entity_type.id == EntityType::FISHING_BOBBER.id {
+        "minecraft:fishing_hook"
+    } else if entity_type.id == EntityType::EVOKER_FANGS.id {
+        "minecraft:evocation_fang"
+    } else if entity_type.id == EntityType::TRIDENT.id {
+        "minecraft:thrown_trident"
+    } else if entity_type.id == EntityType::FIREWORK_ROCKET.id {
+        "minecraft:fireworks_rocket"
+    } else if entity_type.id == EntityType::EYE_OF_ENDER.id {
+        "minecraft:eye_of_ender_signal"
+    } else if entity_type.id == EntityType::ZOMBIE_VILLAGER.id {
+        "minecraft:zombie_villager_v2"
+    } else {
+        entity_type.resource_name
+    }
+}
+
 pub trait EntityBase: Send + Sync + std::any::Any {
     fn write_nbt(&self, nbt: &mut NbtCompound) {
         self.get_entity().write_nbt(nbt);
@@ -212,6 +234,34 @@ pub trait EntityBase: Send + Sync + std::any::Any {
 
     fn get_home_pos(&self) -> Option<pumpkin_util::math::position::BlockPos> {
         None
+    }
+
+    #[must_use]
+    fn resolve_dynamic_raw_id(
+        &self,
+        registry: &str,
+        name: &str,
+        static_fallback: impl FnOnce(&str) -> Option<u32>,
+    ) -> Option<u32>
+    where
+        Self: Sized,
+    {
+        self.get_entity()
+            .resolve_dynamic_raw_id(registry, name, static_fallback)
+    }
+
+    #[must_use]
+    fn resolve_dynamic_entry_id(
+        &self,
+        registry: &str,
+        raw_id: u32,
+        static_fallback: impl FnOnce(u32) -> String,
+    ) -> String
+    where
+        Self: Sized,
+    {
+        self.get_entity()
+            .resolve_dynamic_entry_id(registry, raw_id, static_fallback)
     }
 
     fn as_any(&self) -> &dyn std::any::Any
@@ -288,6 +338,11 @@ pub trait EntityBase: Send + Sync + std::any::Any {
 
     fn get_gravity(&self) -> f64 {
         0.0
+    }
+
+    /// Extra metadata to accompany this entity when spawned for Bedrock clients (e.g. falling block variant, TNT fuse).
+    fn entity_bedrock_spawn_metadata(&self) -> Option<SyncedActorDataList> {
+        None
     }
 
     /// Bedrock network Y above the feet. Endstone `getBaseOffset`.
@@ -410,6 +465,17 @@ pub trait EntityBase: Send + Sync + std::any::Any {
         false
     }
 
+    fn can_be_seen_by_anyone(&self) -> bool {
+        self.get_living_entity()
+            .is_some_and(|living| !self.is_spectator() && living.is_alive())
+    }
+
+    fn can_be_seen_as_enemy(&self) -> bool {
+        self.get_living_entity()
+            .is_some_and(|living| !living.entity.invulnerable.load(Ordering::Relaxed))
+            && self.can_be_seen_by_anyone()
+    }
+
     fn dampens_vibrations(&self) -> bool {
         false
     }
@@ -497,9 +563,11 @@ pub trait EntityBase: Send + Sync + std::any::Any {
         let identifier = self
             .get_mob()
             .and_then(mob::Mob::mob_bedrock_identifier)
-            .unwrap_or(entity.entity_type.resource_name);
-        // TODO: non-mob spawn metadata hook like `mob_bedrock_spawn_metadata` (falling block, TNT).
+            .unwrap_or_else(|| entity_type_to_bedrock_identifier(entity.entity_type));
         let mut metadata = entity.bedrock_metadata();
+        if let Some(extra_meta) = self.entity_bedrock_spawn_metadata() {
+            metadata.0.extend(extra_meta.0);
+        }
         if let Some(mob) = self.get_mob()
             && let Some(mob_metadata) = mob.mob_bedrock_spawn_metadata()
         {
@@ -887,6 +955,16 @@ pub trait EntityBase: Send + Sync + std::any::Any {
         0
     }
 
+    fn should_drop_loot(&self) -> bool {
+        self.get_living_entity()
+            .is_none_or(LivingEntity::should_drop_loot)
+    }
+
+    fn should_drop_experience(&self) -> bool {
+        self.get_living_entity()
+            .is_none_or(LivingEntity::should_drop_experience)
+    }
+
     fn get_base_experience_reward(&self) -> u32 {
         0
     }
@@ -998,6 +1076,7 @@ pub struct Entity {
     pub bounding_box: EntityBoundingBox,
     ///The size (width and height) of the bounding box
     pub entity_dimension: AtomicCell<EntityDimensions>,
+    default_dimensions: AtomicCell<Option<EntityDimensions>>,
     /// Whether this entity is invulnerable to all damage
     pub invulnerable: AtomicBool,
     /// List of damage types this entity is immune to
@@ -1132,6 +1211,41 @@ impl EntityBoundingBox {
 }
 
 impl Entity {
+    #[must_use]
+    pub fn get_server(&self) -> Option<std::sync::Arc<Server>> {
+        self.world.load().server.upgrade()
+    }
+
+    #[must_use]
+    pub fn resolve_dynamic_raw_id(
+        &self,
+        registry: &str,
+        name: &str,
+        static_fallback: impl FnOnce(&str) -> Option<u32>,
+    ) -> Option<u32> {
+        self.get_server()
+            .and_then(|s| {
+                s.datapack_manager
+                    .get_dynamic_registry_raw_id(registry, name)
+            })
+            .or_else(|| static_fallback(name))
+    }
+
+    #[must_use]
+    pub fn resolve_dynamic_entry_id(
+        &self,
+        registry: &str,
+        raw_id: u32,
+        static_fallback: impl FnOnce(u32) -> String,
+    ) -> String {
+        self.get_server()
+            .and_then(|s| {
+                s.datapack_manager
+                    .get_dynamic_registry_entry_id(registry, raw_id)
+            })
+            .unwrap_or_else(|| static_fallback(raw_id))
+    }
+
     pub fn new(
         world: Arc<World>,
         position: Vector3<f64>,
@@ -1218,6 +1332,7 @@ impl Entity {
             pose: AtomicCell::new(EntityPose::Standing),
             bounding_box,
             entity_dimension: AtomicCell::new(bounding_box_size),
+            default_dimensions: AtomicCell::new(None),
             invulnerable: AtomicBool::new(false),
             damage_immunities: std::sync::Mutex::new(Vec::new()),
             data: AtomicI32::new(0),
@@ -1297,13 +1412,17 @@ impl Entity {
         }
 
         let mut metadata = SyncedActorDataList::new();
+        let dimensions = self
+            .default_dimensions
+            .load()
+            .unwrap_or_else(|| Self::type_dimensions(self.entity_type));
         metadata.set(
             entity_data_key::WIDTH,
-            MetadataValue::Float(self.entity_type.dimension[0]),
+            MetadataValue::Float(dimensions.width),
         );
         metadata.set(
             entity_data_key::HEIGHT,
-            MetadataValue::Float(self.entity_type.dimension[1]),
+            MetadataValue::Float(dimensions.height),
         );
         metadata.set(entity_data_key::SCALE, MetadataValue::Float(1.0));
         metadata.set(
@@ -1490,7 +1609,94 @@ impl Entity {
                 _ => {}
             }
         }
-        Self::type_dimensions(self.entity_type)
+        self.default_dimensions
+            .load()
+            .unwrap_or_else(|| Self::type_dimensions(self.entity_type))
+    }
+
+    pub fn set_default_dimensions(&self, dimensions: EntityDimensions) {
+        self.default_dimensions.store(Some(dimensions));
+        self.refresh_dimensions();
+    }
+
+    pub fn refresh_dimensions(&self) {
+        let mut metadata = SyncedActorDataList::new();
+        self.refresh_dimensions_into(&mut metadata);
+        self.send_bedrock_actor_data(&metadata);
+    }
+
+    fn refresh_dimensions_into(&self, metadata: &mut SyncedActorDataList) {
+        let old_dimensions = self.entity_dimension.load();
+        let dimensions = self.get_dimensions(self.pose.load());
+        self.entity_dimension.store(dimensions);
+        let pos = self.pos.load();
+        self.bounding_box
+            .store(BoundingBox::new_from_pos(pos.x, pos.y, pos.z, &dimensions));
+        metadata.set(
+            entity_data_key::WIDTH,
+            MetadataValue::Float(dimensions.width),
+        );
+        metadata.set(
+            entity_data_key::HEIGHT,
+            MetadataValue::Float(dimensions.height),
+        );
+        let is_small = dimensions.width <= 4.0 && dimensions.height <= 4.0;
+        if self.tick_count.load(Relaxed) > 0
+            && !self.no_physics.load(Relaxed)
+            && is_small
+            && (dimensions.width > old_dimensions.width
+                || dimensions.height > old_dimensions.height)
+            && self.entity_type != &EntityType::PLAYER
+        {
+            self.fudge_position_after_size_change(old_dimensions);
+        }
+    }
+
+    pub fn fudge_position_after_size_change(&self, previous_dimensions: EntityDimensions) -> bool {
+        let world = self.world.load();
+        let Some(this) = world.get_entity_by_id(self.entity_id) else {
+            return false;
+        };
+        let new_dimensions = self.get_dimensions(self.pose.load());
+        let old_center =
+            self.pos
+                .load()
+                .add_raw(0.0, f64::from(previous_dimensions.height) / 2.0, 0.0);
+        let width_delta =
+            f64::from((new_dimensions.width - previous_dimensions.width).max(0.0)) + 1.0E-6;
+        let height_delta =
+            f64::from((new_dimensions.height - previous_dimensions.height).max(0.0)) + 1.0E-6;
+        let new_width = f64::from(new_dimensions.width);
+        let new_height = f64::from(new_dimensions.height);
+        let previous_height = f64::from(previous_dimensions.height);
+
+        let allowed_centers =
+            BoundingBox::of_size(old_center, width_delta, height_delta, width_delta);
+        if let Some(free_position) = world.find_free_position(
+            this.as_ref(),
+            &allowed_centers,
+            old_center,
+            Vector3::new(new_width, new_height, new_width),
+        ) {
+            self.set_pos(free_position.add_raw(0.0, -new_height / 2.0, 0.0));
+            return true;
+        }
+        if new_dimensions.width > previous_dimensions.width
+            && new_dimensions.height > previous_dimensions.height
+        {
+            let allowed_centers_ignoring_y =
+                BoundingBox::of_size(old_center, width_delta, 1.0E-6, width_delta);
+            if let Some(free_position) = world.find_free_position(
+                this.as_ref(),
+                &allowed_centers_ignoring_y,
+                old_center,
+                Vector3::new(new_width, previous_height, new_width),
+            ) {
+                self.set_pos(free_position.add_raw(0.0, -previous_height / 2.0 + 1.0E-6, 0.0));
+                return true;
+            }
+        }
+        false
     }
 
     pub fn get_eye_height(&self) -> f64 {
@@ -2331,38 +2537,40 @@ impl Entity {
                 let entity_id = self.entity_id;
                 let yaw = self.yaw.load();
 
-                let rt_handle = world_clone.server.upgrade().map(|s| s.runtime.clone());
-                rayon::spawn(move || {
-                    let _guard = rt_handle.as_ref().map(tokio::runtime::Handle::enter);
-                    let Some(entity_arc) = world_clone.get_entity_by_id(entity_id) else {
-                        return;
-                    };
-                    let transition = portal_type.get_portal_destination(
-                        &world_clone,
-                        dest_world_opt,
-                        entity_arc.as_ref(),
-                        src_portal.as_ref(),
-                    );
+                if let Some(server) = world_clone.server.upgrade() {
+                    server.spawn_task(async move {
+                        let Some(entity_arc) = world_clone.get_entity_by_id(entity_id) else {
+                            return;
+                        };
+                        let transition = portal_type
+                            .get_portal_destination(
+                                &world_clone,
+                                dest_world_opt,
+                                entity_arc.as_ref(),
+                                src_portal.as_ref(),
+                            )
+                            .await;
 
-                    if let Some(transition) = transition {
-                        let dest_world = transition.new_world.clone();
-                        let yaw_val = transition.yaw;
-                        let pitch = transition.pitch;
-                        let teleport_pos = transition.position;
+                        if let Some(transition) = transition {
+                            let dest_world = transition.new_world.clone();
+                            let yaw_val = transition.yaw;
+                            let pitch = transition.pitch;
+                            let teleport_pos = transition.position;
 
-                        // Teleport the main entity
-                        entity_arc.teleport(teleport_pos, yaw_val, pitch, dest_world.clone());
+                            // Teleport the main entity
+                            entity_arc.teleport(teleport_pos, yaw_val, pitch, dest_world.clone());
 
-                        // Teleport all passengers recursively along with the vehicle
-                        let yaw_delta = yaw_val.map(|y| y - yaw);
-                        Self::teleport_passengers_recursive(
-                            entity_arc.get_entity(),
-                            teleport_pos,
-                            yaw_delta,
-                            &dest_world,
-                        );
-                    }
-                });
+                            // Teleport all passengers recursively along with the vehicle
+                            let yaw_delta = yaw_val.map(|y| y - yaw);
+                            Self::teleport_passengers_recursive(
+                                entity_arc.get_entity(),
+                                teleport_pos,
+                                yaw_delta,
+                                &dest_world,
+                            );
+                        }
+                    });
+                }
             } else if portal_processor.portal_time == 0 {
                 should_remove = true;
             }
@@ -3245,23 +3453,11 @@ impl Entity {
             }
         }
 
-        let dimension = self.get_dimensions(pose);
-        let position = self.pos.load();
-        let aabb = BoundingBox::new_from_pos(position.x, position.y, position.z, &dimension);
         self.pose.store(pose);
-        self.bounding_box.store(aabb);
-        self.entity_dimension.store(dimension);
         let pose = pose as i32;
         let mut bedrock_meta = SyncedActorDataList::new();
         bedrock_meta.set(entity_data_key::POSE_INDEX, MetadataValue::Int(pose));
-        bedrock_meta.set(
-            entity_data_key::WIDTH,
-            MetadataValue::Float(dimension.width),
-        );
-        bedrock_meta.set(
-            entity_data_key::HEIGHT,
-            MetadataValue::Float(dimension.height),
-        );
+        self.refresh_dimensions_into(&mut bedrock_meta);
         self.set_synced_data(tracked_data::entity::DATA_POSE, VarInt(pose));
         self.send_bedrock_actor_data(&bedrock_meta);
     }
@@ -3723,6 +3919,36 @@ impl Entity {
             .passengers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Some(player) = passenger.get_player() {
+            let other_passenger_type = passengers
+                .first()
+                .map(|p| format!("minecraft:{}", p.get_entity().entity_type.resource_name));
+            player.trigger_advancement(
+                crate::entity::player::advancement::trigger::AdvancementTrigger::StartedRiding {
+                    vehicle_type: Some(format!("minecraft:{}", self.entity_type.resource_name)),
+                    passenger_type: other_passenger_type,
+                },
+            );
+        } else {
+            for p in passengers.iter() {
+                if let Some(player) = p.get_player() {
+                    player.trigger_advancement(
+                        crate::entity::player::advancement::trigger::AdvancementTrigger::StartedRiding {
+                            vehicle_type: Some(format!(
+                                "minecraft:{}",
+                                self.entity_type.resource_name
+                            )),
+                            passenger_type: Some(format!(
+                                "minecraft:{}",
+                                passenger_entity.entity_type.resource_name
+                            )),
+                        },
+                    );
+                }
+            }
+        }
+
         passengers.push(passenger);
 
         let passenger_ids: Vec<VarInt> = passengers
@@ -4248,6 +4474,12 @@ impl Entity {
             nbt.put("CustomName", tag);
         }
         nbt.put_bool("CustomNameVisible", self.custom_name_visible.load(Relaxed));
+        if self.is_silent() {
+            nbt.put_bool("Silent", true);
+        }
+        if self.has_no_gravity() {
+            nbt.put_bool("NoGravity", true);
+        }
 
         let tags = self
             .scoreboard_tags
@@ -4351,6 +4583,8 @@ impl Entity {
         if let Some(visible) = nbt.get_bool("CustomNameVisible") {
             self.set_custom_name_visible(visible);
         }
+        self.set_silent(nbt.get_bool("Silent").unwrap_or(false));
+        self.set_has_no_gravity(nbt.get_bool("NoGravity").unwrap_or(false));
 
         if let Some(tag_list) = nbt.get_list("Tags") {
             let mut tags = self
@@ -4528,5 +4762,38 @@ mod tests {
                 "status mismatch at index {i}"
             );
         }
+    }
+
+    #[test]
+    fn entity_type_bedrock_identifier_mappings() {
+        assert_eq!(
+            entity_type_to_bedrock_identifier(&EntityType::EXPERIENCE_ORB),
+            "minecraft:xp_orb"
+        );
+        assert_eq!(
+            entity_type_to_bedrock_identifier(&EntityType::FISHING_BOBBER),
+            "minecraft:fishing_hook"
+        );
+        assert_eq!(
+            entity_type_to_bedrock_identifier(&EntityType::EVOKER_FANGS),
+            "minecraft:evocation_fang"
+        );
+        assert_eq!(
+            entity_type_to_bedrock_identifier(&EntityType::TRIDENT),
+            "minecraft:thrown_trident"
+        );
+        assert_eq!(
+            entity_type_to_bedrock_identifier(&EntityType::FIREWORK_ROCKET),
+            "minecraft:fireworks_rocket"
+        );
+        assert_eq!(
+            entity_type_to_bedrock_identifier(&EntityType::EYE_OF_ENDER),
+            "minecraft:eye_of_ender_signal"
+        );
+        assert_eq!(
+            entity_type_to_bedrock_identifier(&EntityType::ZOMBIE_VILLAGER),
+            "minecraft:zombie_villager_v2"
+        );
+        assert_eq!(entity_type_to_bedrock_identifier(&EntityType::COW), "cow");
     }
 }
